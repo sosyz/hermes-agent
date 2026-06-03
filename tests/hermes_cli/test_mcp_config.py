@@ -6,12 +6,7 @@ any actual MCP servers or API keys.
 """
 
 import argparse
-import json
-import os
-import types
 from pathlib import Path
-from typing import Any, Dict, List
-from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
 
@@ -43,7 +38,7 @@ def _make_args(**kwargs):
     defaults = {
         "name": "test-server",
         "url": None,
-        "command": None,
+        "mcp_command": None,
         "args": None,
         "auth": None,
         "preset": None,
@@ -233,7 +228,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            command="npx",
+            mcp_command="npx",
             args=["@mcp/github"],
         ))
         out = capsys.readouterr().out
@@ -291,7 +286,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            command="npx",
+            mcp_command="npx",
             args=["@mcp/github"],
             env=["MY_API_KEY=secret123", "DEBUG=true"],
         ))
@@ -313,7 +308,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            command="npx",
+            mcp_command="npx",
             args=["@mcp/github"],
             env=["BAD-NAME=value"],
         ))
@@ -390,7 +385,7 @@ class TestMcpAdd:
         cmd_mcp_add(_make_args(
             name="custom",
             preset="testmcp",
-            command="uvx",
+            mcp_command="uvx",
             args=["custom-server"],
         ))
         out = capsys.readouterr().out
@@ -539,3 +534,119 @@ class TestDispatcher:
         mcp_command(_make_args(mcp_action=None))
         out = capsys.readouterr().out
         assert "Commands:" in out or "No MCP servers" in out
+
+
+# ---------------------------------------------------------------------------
+# Tests: Task 7 consolidation — cmd_mcp_remove evicts manager cache,
+# cmd_mcp_login forces re-auth
+# ---------------------------------------------------------------------------
+
+
+class TestMcpRemoveEvictsManager:
+    def test_remove_evicts_in_memory_provider(self, tmp_path, capsys, monkeypatch):
+        """After cmd_mcp_remove, the MCPOAuthManager no longer caches the provider."""
+        _seed_config(tmp_path, {
+            "oauth-srv": {"url": "https://example.com/mcp", "auth": "oauth"},
+        })
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.get_hermes_home", lambda: tmp_path
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+        reset_manager_for_tests()
+
+        mgr = get_manager()
+        mgr.get_or_build_provider(
+            "oauth-srv", "https://example.com/mcp", None,
+        )
+        assert "oauth-srv" in mgr._entries
+
+        from hermes_cli.mcp_config import cmd_mcp_remove
+        cmd_mcp_remove(_make_args(name="oauth-srv"))
+
+        assert "oauth-srv" not in mgr._entries
+
+
+class TestMcpLogin:
+    def test_login_rejects_unknown_server(self, tmp_path, capsys):
+        _seed_config(tmp_path, {})
+        from hermes_cli.mcp_config import cmd_mcp_login
+        cmd_mcp_login(_make_args(name="ghost"))
+        out = capsys.readouterr().out
+        assert "not found" in out
+
+    def test_login_rejects_non_oauth_server(self, tmp_path, capsys):
+        _seed_config(tmp_path, {
+            "srv": {"url": "https://example.com/mcp", "auth": "header"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_login
+        cmd_mcp_login(_make_args(name="srv"))
+        out = capsys.readouterr().out
+        assert "not configured for OAuth" in out
+
+    def test_login_rejects_stdio_server(self, tmp_path, capsys):
+        _seed_config(tmp_path, {
+            "srv": {"command": "npx", "args": ["some-server"]},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_login
+        cmd_mcp_login(_make_args(name="srv"))
+        out = capsys.readouterr().out
+        assert "no URL" in out or "not an OAuth" in out
+
+    def test_login_false_success_no_token(self, tmp_path, capsys, monkeypatch):
+        """Probe lists tools without auth (Google Drive), but no token landed.
+
+        The server allows tools/list without auth (DCR 400'd), so the probe
+        succeeds yet no OAuth token exists. Login must NOT claim success — it
+        should warn and point the user at pre-registered client_id config.
+        """
+        _seed_config(tmp_path, {
+            "googledrive": {
+                "url": "https://drivemcp.googleapis.com/mcp/v1",
+                "auth": "oauth",
+            },
+        })
+        # Probe returns tools even though auth never completed.
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, cfg: [("search_files", "d"), ("read_file_content", "d")],
+        )
+        # No token file is created → _oauth_tokens_present() returns False.
+        from hermes_cli.mcp_config import cmd_mcp_login
+
+        cmd_mcp_login(_make_args(name="googledrive"))
+        out = capsys.readouterr().out
+
+        assert "no OAuth token was obtained" in out
+        assert "Authenticated" not in out
+        assert "client_id" in out
+
+    def test_login_genuine_success_with_token(self, tmp_path, capsys, monkeypatch):
+        """Probe lists tools AND a token exists → report real success."""
+        _seed_config(tmp_path, {
+            "realserver": {"url": "https://mcp.example.com/mcp", "auth": "oauth"},
+        })
+        token_dir = tmp_path / "mcp-tokens"
+
+        # cmd_mcp_login wipes tokens before probing, then the real OAuth flow
+        # writes a fresh token during the probe. Simulate that: the mocked
+        # probe drops a token file, mirroring a successful authorization.
+        def mock_probe(name, cfg):
+            token_dir.mkdir(exist_ok=True)
+            (token_dir / "realserver.json").write_text('{"access_token": "x"}')
+            return [("a", "d"), ("b", "d"), ("c", "d")]
+
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server", mock_probe
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_login
+
+        cmd_mcp_login(_make_args(name="realserver"))
+        out = capsys.readouterr().out
+
+        assert "Authenticated — 3 tool(s) available" in out
+        assert "no OAuth token" not in out
+
